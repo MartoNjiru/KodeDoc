@@ -456,18 +456,4 @@ rich>=13.0
 
 ---
 
-## README writing rules for this project
 
-Use these when you edit the live `README.md`:
-
-1. **One idea per heading** — do not mix install steps with architecture.
-2. **Commands are tables** — scannable; do not bury them in paragraphs.
-3. **Honesty first** — state model limits and polyglot false-negative risk up front.
-4. **Copy-pasteable blocks** — every install / run snippet should work without edits except the clone URL.
-5. **Version in one place** — badge or first line of Overview should match `VERSION` in `kodedoc.py`.
-6. **No emojis in headings** unless you deliberately want a playful tone; this tool is operational.
-7. **Keep the pipeline section current** — if step order changes in code, update Debug pipeline the same day.
-
----
-
-*End of documentation blueprint. Paste each subheading into your repository README and fill from the suggested content above.*
