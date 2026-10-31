@@ -165,23 +165,28 @@ def call_ollama(prompt: str, stream: bool = False) -> Optional[str]:
     if not STATE.model: return None
     url = f"{STATE.ollama_url.rstrip('/')}/api/generate"
     
-    # Safer options to prevent 400 Bad Request
+    # FIX 1: Truncate massive prompts so the model doesn't choke
+    if len(prompt) > 25000:
+        CONSOLE.print("  [yellow]⚠ Prompt is too large. Truncating to fit context window.[/yellow]")
+        prompt = prompt[:25000] + "\n... [TRUNCATED]"
+
     payload = {
         "model": STATE.model, 
         "prompt": prompt, 
         "stream": stream,
         "options": {
             "temperature": 0.0, 
-            "num_predict": 8192,   # Limit output to 8k tokens
+            "num_predict": 4096,   # Max 4k output tokens (faster)
             "top_p": 0.9, 
-            "num_ctx": 8192        # Limit context window to 8k tokens
+            "num_ctx": 4096        # Max 4k context window
         },
     }
     
     try:
         if stream:
             full = ""
-            with requests.post(url, json=payload, stream=True, timeout=None) as resp:
+            # FIX 2: Timeout to 5 mins so it doesn't hang forever
+            with requests.post(url, json=payload, stream=True, timeout=300) as resp:
                 resp.raise_for_status()
                 for raw_line in resp.iter_lines():
                     if raw_line:
@@ -189,39 +194,62 @@ def call_ollama(prompt: str, stream: bool = False) -> Optional[str]:
                             obj = json.loads(raw_line)
                             chunk = obj.get("response", "")
                             full += chunk
-                            print(chunk, end="", flush=True)
+                            # FIX 3: Use CONSOLE.print so Rich handles the terminal buffer
+                            CONSOLE.print(chunk, end="", markup=False, highlight=False)
                         except json.JSONDecodeError: pass
-            print()
+            CONSOLE.print()
             return full or None
             
-        resp = requests.post(url, json=payload, timeout=None)
+        resp = requests.post(url, json=payload, timeout=300)
         resp.raise_for_status()
         return resp.json().get("response", "") or None
         
+    except requests.exceptions.Timeout:
+        CONSOLE.print("\n  [red]✖ Model timed out after 5 minutes.[/red]")
+        return None
     except requests.exceptions.HTTPError as e:
-        CONSOLE.print(f"  [red]✖ Model rejected the request (400): {e}[/red]")
-        CONSOLE.print("  [dim]Try switching models with the 'model' command.[/dim]")
+        CONSOLE.print(f"\n  [red]✖ Model rejected the request: {e}[/red]")
         return None
     except Exception as exc:
-        CONSOLE.print(f"  [red]✖ Ollama error: {escape(str(exc))}[/red]")
+        CONSOLE.print(f"\n  [red]✖ Ollama error: {escape(str(exc))}[/red]")
         return None
 
 def call_model(prompt: str, stream: bool = False) -> Optional[str]:
     return call_ollama(prompt, stream=stream)
 
 def extract_code(text: str) -> str:
-    # Strip AI refusals
+    """Strip markdown fences, refusals, and AI placeholders."""
+    
+    # Catch AI refusals or giving up
     refusal_pattern = r"(?i)^(?:sorry[,! ]*)?(?:this|the provided|it) (?:code|script|snippet|file) (?:is|appears to be|looks like|seems to be) (?:not|written in|a|an) [a-zA-Z0-9_+#.]+"
     if re.search(refusal_pattern, text[:300]):
         text = re.sub(refusal_pattern, "Here is the fixed code:\n", text)
-    
+
     match = re.search(r"```(?:[a-zA-Z0-9_+#.-]*)?\n?([\s\S]*?)```", text)
-    if match: return match.group(1).strip()
-    
-    lines = text.strip().splitlines()
-    if lines and re.match(r"^(Fixed|Corrected|Rewritten|Output|Result|Fully corrected|Complete|Here|Test)\s", lines[0], re.I):
-        lines = lines[1:]
-    return "\n".join(lines).strip()
+    if match:
+        code = match.group(1).strip()
+    else:
+        lines = text.strip().splitlines()
+        if lines and re.match(r"^(Fixed|Corrected|Rewritten|Output|Result|Fully corrected|Complete|Here|Test)\s", lines[0], re.I):
+            lines = lines[1:]
+        code = "\n".join(lines).strip()
+
+    # SANITY CHECK: Catch placeholders and AI giving up
+    bad_signals = [
+        "Placeholder", 
+        "Please provide", 
+        "Error context",
+        "I cannot", 
+        "I need the full context",
+        "// ... rest of code",
+        "# ... rest of code"
+    ]
+    for signal in bad_signals:
+        if signal.lower() in code.lower():
+            CONSOLE.print(f"  [red]✖ AI hallucinated a placeholder instead of fixing the code.[/red]")
+            return "" # Return empty so the pipeline knows it failed
+            
+    return code
 
 def extract_dependencies(analysis_text: str, code: str) -> list[str]:
     deps = set()
@@ -397,20 +425,48 @@ def load_file_flow() -> str:
         CONSOLE.print(f"  [red]Read error: {e}[/red]"); return ""
 
 def copy_output() -> None:
-    if not STATE.last_fixed: return
+    if not STATE.last_fixed:
+        CONSOLE.print("  [red]Nothing to copy. Run 'debug' or 'convert' first.[/red]")
+        return
+    
+    CONSOLE.print("  [dim]Copying to clipboard...[/dim]")
+    
+    # Try clip.exe (WSL) but with a timeout so it doesn't hang
     try:
         process = subprocess.Popen(['clip.exe'], stdin=subprocess.PIPE, text=True)
-        process.communicate(input=STATE.last_fixed)
-        CONSOLE.print("  [green]✔ Copied to Windows clipboard![/green]")
+        process.communicate(input=STATE.last_fixed, timeout=3)
+        CONSOLE.print("  [green]✔ Copied to clipboard![/green]")
+        return
     except FileNotFoundError:
-        CONSOLE.print("  [yellow]clip.exe not found. Use 'export'.[/yellow]")
-
+        pass
+    except subprocess.TimeoutExpired:
+        # If clip.exe hangs, kill it and try the fallback
+        process.kill()
+    
+    # Linux/Mac fallbacks
+    text = STATE.last_fixed.encode()
+    for cmd in (["pbcopy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]):
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+            proc.communicate(text, timeout=3)
+            CONSOLE.print("  [green]✔ Copied to clipboard[/green]")
+            return
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+            
+    # Python pyperclip fallback
+    try:
+        import pyperclip
+        pyperclip.copy(STATE.last_fixed)
+        CONSOLE.print("  [green]✔ Copied to clipboard[/green]")
+    except Exception:
+        CONSOLE.print("  [red]✖ Clipboard failed. Use 'export' to save to a file instead.[/red]")
 def run_debug(code: str) -> None:
     if not STATE.lang or not STATE.model or not code.strip(): return
     STATE.running = True
     
     CONSOLE.print(f"\n[bold cyan]● Step 1 — Deep analysis ({STATE.lang})…[/bold cyan]")
-    analysis = call_model(build_analysis_prompt(code), stream=False)
+    analysis = call_model(build_analysis_prompt(code), stream=True)
     if not analysis: STATE.running = False; return
     CONSOLE.print(f"  [yellow]{len(analysis.splitlines())} lines of analysis generated.[/yellow]")
     
@@ -421,8 +477,16 @@ def run_debug(code: str) -> None:
     
     CONSOLE.print("\n[bold cyan]● Step 3 — Rewriting and Fixing…[/bold cyan]")
     fix_response = call_model(build_fix_prompt(code, analysis), stream=False)
-    if not fix_response: STATE.running = False; return
+    if not fix_response: 
+        STATE.running = False
+        return
     fixed = extract_code(fix_response)
+    
+    if not fixed:
+        CONSOLE.print("  [red]✖ The model failed to output the full code (it used placeholders).[/red]")
+        CONSOLE.print("  [yellow]Try switching to a smarter model like 'qwen2.5-coder'.[/yellow]")
+        STATE.running = False
+        return
     
     CONSOLE.print("\n[bold cyan]● Step 4 — Agentic Verification Loop…[/bold cyan]")
     fixed = execute_and_fix(fixed)
@@ -483,8 +547,14 @@ def main() -> None:
             if text: code_buffer = text
         elif cmd == "clear": code_buffer = ""
         elif cmd == "debug":
-            if code_buffer: run_debug(code_buffer)
-            else: CONSOLE.print("  [red]Buffer empty.[/red]")
+            if not code_buffer.strip():
+                CONSOLE.print("  [red]✖ Buffer is empty. Use 'load' to read a file first.[/red]")
+            elif not STATE.model:
+                CONSOLE.print("  [red]✖ No model selected. Use 'model' first.[/red]")
+            elif not STATE.lang:
+                CONSOLE.print("  [red]✖ No language selected. Use 'lang' first.[/red]")
+            else:
+                run_debug(code_buffer)
         elif cmd == "diff": STATE.diff_mode = not STATE.diff_mode
         elif cmd == "copy": copy_output()
         elif cmd == "convert":
